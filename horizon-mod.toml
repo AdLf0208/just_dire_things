@@ -1,0 +1,24 @@
+# Slice 1 of the Just Dire Things port: the Simple Coal Generator and the four
+# coals it burns. Assets and data are carried from the ATM10 jar
+# (justdirethings-1.5.7.jar), with the choices documented in CONTENT.md.
+# Licence: MIT (Direwolf20-MC/JustDireThings); local-only until the maintainer
+# approves publishing.
+id = "justdirethings"
+name = "Just Dire Things"
+version = "0.1.0"
+description = """Just Dire Things for Horizon, slice 1: the Simple Coal Generator and the four coals it burns.
+
+One block, one fuel slot, one insert-only FE buffer and one server tick, carried
+from Just Dire Things 1.5.7 (MIT) as a clean-room Rust rewrite."""
+authors = ["Direwolf20"]
+# A native mod: Rust in src/, compiled by the launcher against the game build [native] pins,
+# beside data/ and assets/. The id is the resource namespace and the only identity.
+api = "0.2"
+side = "both"
+# registries: "May add blocks, items, mob effects and entity types to your worlds".
+capabilities = ["registries"]
+
+[native]
+game = "26.3"
+horizon = "0b14f8acfd97fa2c750e42795249dcc981178ca4"
+mixins = "e59da9094f0c2fdda6c627fe9eff22dec6a906f0"
