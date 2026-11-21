@@ -1,4 +1,7 @@
-# Just Dire Things — port notes, slice 1 (the Simple Coal Generator)
+# Just Dire Things — port notes
+
+**Slice 1** (the Simple Coal Generator) shipped as `0.1.0`; **slice 2** (the four
+redstone modes) is `0.2.3` — see `## Slice 2 — the redstone control` below.
 
 Ported from **Just Dire Things 1.5.7** (`Direwolf20-MC/JustDireThings`, **MIT**),
 the exact ATM10 jar `justdirethings-1.5.7.jar` (SHA-1
@@ -41,6 +44,122 @@ the Fuel Generator, the pocket generator, item automation) build on it. The jar
 inventory behind the choice, and the other families it ships, are in
 `FINDINGS.md`.
 
+## Slice 2 — the redstone control (the four modes)
+
+**Gap line it comes from** (`notes.md` §Gaps 12, quoted as it stood after slice 1):
+*"**Redstone modes** beyond the `IGNORED` default, the comparator output and the
+`isRedstoneConductor = false` property: no content property for the last one, no hook
+declared for the second."*
+
+**Why this family, and why it fits the tier.** `RedstoneControlledBE` is the **base-class
+behaviour every later Just Dire Things machine inherits**, so it lays the foundation for the
+`machines` shape inside the `deep` tier instead of adding a one-off. It is fully expressible at
+this pin — the signal is one read (`LevelRef::has_neighbor_signal`, the same call
+`actuallyadditions` makes), the state is three saved keys and the gate is one closure — and it is
+provable with **vanilla blocks only** (a redstone block placed and removed), so no renderer, no
+menu and no new capability. Plan: `PLAN-slice2.md`.
+
+Two corrections the artefact forced on the old gap text:
+
+1. **Upstream has no comparator output.** A `grep` over the 1.5.7 sources finds no
+   `hasAnalogOutputSignal`/`getAnalogOutputSignal` override on `BaseMachineBlock` or any machine
+   block entity, so the port must not invent one; that clause is **withdrawn** with that evidence.
+2. **The mode set is four, not "beyond IGNORED"**: `MiscHelpers.RedstoneMode`
+   (`IGNORED, LOW, HIGH, PULSE`, in that order, the ordinal being the saved value) and the jar's
+   own GUI button textures `redstone{ignore,low,high,pulse}.png` agree.
+
+**Upstream files read** (analysis only, not translated) — tag `v1.5.7`, commit
+`8390e0effa33cd0e0995265245baf5629b61ef22`: `util/MiscHelpers.java` (`RedstoneMode`),
+`util/interfacehelpers/RedstoneControlData.java`, `common/blockentities/basebe/RedstoneControlledBE.java`
+(`evaluateRedstone`, `isActiveRedstone`, save/load), `common/blockentities/basebe/BaseMachineBE.java`
+(`tickServer` order, `canRun`), `common/blocks/baseblocks/BaseMachineBlock.java`
+(`neighborChanged` clears the latch), `common/blockentities/GeneratorT1BE.java` (`doGenerate`'s two
+`isActiveRedstone()` calls).
+
+| | Upstream | This port |
+|---|---|---|
+| modes | `IGNORED, LOW, HIGH, PULSE` (ordinal saved) | same, `RedstoneMode` (`runtime.rs`) |
+| sample | `evaluateRedstone`: record the signal; latch one pulse on a **rising** edge in `PULSE` | `RedstoneControl::sample` |
+| gate | `isActiveRedstone`, asked to **start** a burn and again for the boundary top-up | `RedstoneControl::active`, a closure so `PULSE` can *spend* its latch |
+| in-progress burn | the gate is not consulted: a burn that started runs to its end | same, unit-tested (`high_mode_keeps_an_in_progress_burn…`) |
+| saved state | `redstoneMode`, `pulsed`, `receivingRedstone` | the same three keys in the block entity's compound |
+| control | a GUI button | `/justdirethings mode <mode:word> <pos>` (operator, in reach) — a harness control, as `/justdirethings set` is |
+
+### The defect the in-game leg found, and the fix
+
+The first in-game run of this slice failed at the **second** rising edge of `PULSE`
+(`e2e-slice2-launcher-attempt1.log`): one edge bought a burn, a held signal bought none, but
+after the block was removed and replaced nothing burned again. The cause is the tick's
+`BlockEntityTickReply::Unchanged` guard: it discarded the payload whenever nothing was produced
+and no fuel was pulled, which **also discarded the recorded falling edge**. `receiving` stayed
+`true` in the saved state, so the next rising edge was not a rising edge.
+
+- Rule now in `runtime::persists(produced, pulled, before, after)`: keep the payload when
+  something burnt, a fuel item was pulled, **or the redstone control changed**. The glue replies
+  `Unchanged` only when none of the three holds.
+- Red first: `a_falling_edge_is_kept_even_when_nothing_burned` failed at the
+  `persists(0, 0, before, after)` assertion with *"a falling edge with no burn must still be
+  written back"* (`../_shared/evidence/justdirethings-slice2/red-falling-edge.log`), then the
+  clause `before != after` made it green (26 tests).
+- Proven again in game: the same scenario now reads `3000/1000000 FE … stick x2` after the second
+  edge — one stick's burn per edge, two edges, two sticks.
+
+This is a port-side bug rather than a mod defect (the Java tick writes its state unconditionally),
+so it is recorded as a defect found by the harness and fixed, not as an upstream report.
+
+### Coverage (ruling 2026-11-20)
+
+| Family (gap line) | Status | Where it is proven |
+|---|---|---|
+| `IGNORED` (default) runs whatever the signal | **tested** | unit `ignored_runs_whatever_the_signal`, `ignored_still_tops_up_the_tick_a_burn_ends_in`; in game: the whole slice-1 phase |
+| `LOW` runs unpowered, stops while powered | **tested** | unit `low_runs_unpowered_high_runs_powered`; in game: frozen buffer for 40 ticks, resumes after the block is removed |
+| `HIGH` runs only while powered | **tested** | same unit test; in game: 0 FE for 40 ticks unpowered, then a burn with a redstone block beside it |
+| `PULSE` one burn per rising edge, none for a held signal | **tested** | units `pulse_runs_once_per_rising_edge_and_ignores_a_held_signal`, `a_pulse_starts_one_burn_that_then_runs_its_course`, `no_new_burn_starts_without_the_next_edge`, `a_pulse_does_not_top_up_the_tick_a_burn_ends_in`; in game: 1,500 FE per edge, `stick x4 → x3 → x2` |
+| the saved mode round-trips, an unknown value loads as `IGNORED` | **tested** | units `the_four_modes_are_upstreams_and_round_trip`, `an_unknown_saved_mode_reads_as_ignored` |
+| the mode control is an operator command | **tested (unit only)** | `the_redstone_mode_control_is_operator_only`, `a_player_below_level_two_may_not_administer`; a LAN guest on this pin **joins with command permission**, so the level-0 path cannot be produced in this harness (see below) |
+| the mode control obeys the distance guard | **tested** | in game: a guest 40 blocks away is refused (`That generator is out of reach.`) for both `set` and `mode`, and the same guest one block away lands both |
+| comparator output | **not ported — withdrawn** | upstream has none (grep evidence above) |
+| `isRedstoneConductor = false` | **not ported** (gap 12) | no content property for it at this pin |
+
+**Measured, not assumed:** a LAN guest (`ctl lan open 0 commands`) on `0a875da` joins with a
+permission level at or above `Gamemasters` — `deop Guest` does not change it — so the operator
+gate's *refusal* cannot be exercised by a second player here. It stays covered by the unit tests
+plus the declared `Command::op(..., 2)`, and the reach guard is the in-game proof that another
+player cannot write to a machine they are not standing at.
+
+### In-game transcript (quoted from `e2e-slice2-launcher.log`)
+
+```
+  default mode: Simple Coal Generator at 12,100,0: 0/1000000 FE (burning false, fe 0 of 0, burn 0/0, multiplier 1, mode ignored, fuel empty, t=385)
+  mode(12,100,0) = Simple Coal Generator at 12,100,0: 0/1000000 FE (burning false, fe 0 of 0, burn 0/0, multiplier 1, mode high, fuel empty, t=400)
+  HIGH, unpowered after 40 ticks: Simple Coal Generator at 12,100,0: 0/1000000 FE (burning false, fe 0 of 0, burn 0/0, multiplier 1, mode high, fuel minecraft:stick x4, t=470)
+  HIGH, powered: Simple Coal Generator at 12,100,0: 3000/1000000 FE (burning true, fe 1500 of 1500, burn 26/25, multiplier 1, mode high, fuel minecraft:stick x1, t=527)
+  LOW, powered, 40 ticks later: Simple Coal Generator at 12,100,0: 4500/1000000 FE (burning false, fe 0 of 1500, burn 1/25, multiplier 1, mode low, fuel minecraft:stick x1, t=686)
+  LOW, unpowered: Simple Coal Generator at 12,100,0: 6000/1000000 FE (burning false, fe 0 of 0, burn 0/0, multiplier 1, mode low, fuel empty, t=737)
+  PULSE, no edge yet: Simple Coal Generator at 16,100,0: 0/1000000 FE (burning false, fe 0 of 0, burn 0/0, multiplier 1, mode pulse, fuel minecraft:stick x4, t=822)
+  PULSE, rising edge: Simple Coal Generator at 16,100,0: 1140/1000000 FE (burning true, fe 360 of 1500, burn 7/25, multiplier 1, mode pulse, fuel minecraft:stick x3, t=848)
+  PULSE, signal still on after 60 ticks: Simple Coal Generator at 16,100,0: 1500/1000000 FE (burning false, fe 0 of 1500, burn 1/25, multiplier 1, mode pulse, fuel minecraft:stick x3, t=920)
+  PULSE, second edge: Simple Coal Generator at 16,100,0: 3000/1000000 FE (burning false, fe 0 of 1500, burn 1/25, multiplier 1, mode pulse, fuel minecraft:stick x2, t=988)
+  guest position after the host's /tp: 40.5,95.936654946153,40.5
+  guest set reply (40 blocks away): That generator is out of reach. [Player92307: Teleported Guest to 40.500000, 100.000000, 40.500000]
+  guest mode reply (40 blocks away): That generator is out of reach. That generator is out of reach. …
+  guest's target mode after the distant mode: Simple Coal Generator at 8,100,0: 0/1000000 FE (… mode ignored, fuel empty, t=1322)
+  guest set reply (one block away): Energy set to 123 FE. …
+  guest's target after the in-reach set: Simple Coal Generator at 8,100,0: 123/1000000 FE (… mode ignored, fuel empty, t=1383)
+  guest mode reply (one block away): Redstone mode set to high. …
+  guest's target after the in-reach mode: Simple Coal Generator at 8,100,0: 0/1000000 FE (… mode high, fuel empty, t=1464)
+PASS: … HIGH ran only while powered and LOW only while unpowered; PULSE bought exactly one stick's burn per rising edge and a held signal bought none; and a guest 40 blocks away changed neither the buffer nor the mode while the same guest one block away changed both, so the refusal is distance
+EXIT:0
+```
+
+The legs around it: `e2e-slice2-control.log` (the same Nightly without the package: the block id
+is unknown, `FAIL` + `EXIT:1`), `e2e-slice2-selftest.log` (`SELFTEST=1` flips the no-fuel
+assertion, `FAIL` + `EXIT:1`) and `e2e-slice2-selftest-redstone.log` (`SELFTEST=redstone` flips
+the unpowered-`HIGH` assertion, `FAIL` + `EXIT:1`). `check-e2e-logs.py justdirethings-e2e
+--strict` reads all seven logs: `ok=7 missing-exit=0 bad-exit=0`.
+
+Skills: superpowers/using-superpowers, brainstorming, writing-plans, test-driven-development, systematic-debugging, verification-before-completion; BeautifulRust/rust-best-practices
+
 ## Migration to the SDK format
 
 The registry closed PR **#591** on 2026-11-18 with one reason — *republish this
@@ -50,7 +169,10 @@ and everything the slice proved about the machine is unchanged.
 
 **SDK and pin:** build `0b14f8acfd97fa2c750e42795249dcc981178ca4` (2026-11-18),
 mixins `e59da9094f0c2fdda6c627fe9eff22dec6a906f0`, launcher 0.2.78, 749 surface
-items. `horizon-mod.toml`'s `[native]` block is the only pin.
+items. `horizon-mod.toml`'s `[native]` block is the only pin. **The campaign pin moved
+on to `0a875da91dbb0fdcb7ba8c42c11341aa229af51a` (Nightly 2026-11-20, launcher 0.2.92)
+for slice 2**, which is what `0.2.3` declares and what both `fits` lines are quoted
+against.
 
 ### Files created
 
@@ -322,9 +444,10 @@ EXIT:0
     known (48,000 / 144,000 / 432,000 / 1,296,000 ticks) but not carried.
 11. **Break behaviour**: upstream drops the slot's contents and saves the
     machine's settings into the block item; this slice loses both on break.
-12. **Redstone modes** beyond the `IGNORED` default, the comparator output and
-    the `isRedstoneConductor = false` property: no content property for the
-    last one, no hook declared for the second.
+12. **`isRedstoneConductor = false`** — no content property for it, so the block still
+    conducts. (The **four redstone modes** this line used to name are **done** in slice 2; the
+    "comparator output" clause was **withdrawn** — upstream has no such override. See
+    §Slice 2.)
 13. **Crafting**: the carried recipe needs `justdirethings:ferricore_ingot`.
 14. **A non-integer fuel speed multiplier is rounded** (upstream kept an int;
     26.3's component is a float). Vanilla and all four JDT coals are integers.
@@ -358,12 +481,15 @@ Skills for this migration: superpowers/using-superpowers, brainstorming, writing
 
 ## Verification
 
-**Current ladder at the SDK build (`0b14f8a`): `VALIDATION.md` §The SDK ladder** —
-`cargo test` 11 passed, clippy `-D warnings` clean, `cargo horizon-mod build`
-reproducible (SHA-256 `4d1c5f14…58005`, 31,298 B, 38 entries), `cargo horizon-mod
-check` and `fits` green. Evidence: `../_shared/evidence/justdirethings/sdk-*.log`.
-What follows is the record of the retired `.hnmod` build on which the slice's
-gameplay was proved.
+**Current ladder (`0.2.3`, pin `0a875da`): `VALIDATION.md` §Slice 2** — `cargo test` 26
+passed, clippy `-D warnings` clean, two `cargo horizon-mod build` runs `cmp`-identical
+(SHA-256 `8c9be198…a3cd`, 36,240 B, 37 entries), `check` green, `fits` both ways
+(`0a875da made for`, `0b14f8a fits`), `verify-sdk-package.py` 1/1, the in-game leg
+`PASS`+`EXIT:0` with the control and both selftests at `EXIT:1`, and
+`check-e2e-logs.py … --strict` at `ok=7`. Evidence: `../_shared/evidence/justdirethings/`
+and `../_shared/evidence/justdirethings-e2e/`. What follows is the slice-1 record at the
+SDK pin `0b14f8a` and, below it, the retired `.hnmod` build on which the gameplay was
+first proved.
 
 Pin **`1d63e0a5a37a7a708eb0b32b49bf0dfeb28ed8a9`**, mixins
 **`5a64af938ec86b00d53d16a408aabc0038fb3e57`** (schema 6); checkouts
@@ -449,3 +575,26 @@ chat round trip here is far longer than a tick.
 
 - Artifact: `justdirethings.hnmod`, 21,106 B, SHA-256 `a6034d0a1a6c50d9b27973b77968eeb91c0a24c4798d2cfa21c76d01d55fd368` (rebuilt twice, identical bytes; `tools/package.py`; the embedded content equals `content/justdirethings.hmod`).
 - `python3 ports/tools/upstream_ready.py justdirethings` and `check-skills.py --notes ports/justdirethings`: exit 0.
+
+## Review fixes (2026-11-18, PR #1173)
+
+The registry reviewer found the harness control `/justdirethings set` at level 0: it wrote the
+saved energy of any loaded `justdirethings:generatort1` in the command's dimension, with no
+operator, proximity or ownership check, so a player could mint or erase another player's FE.
+
+- **Fix.** The usage is now `Command::op("justdirethings set <amount:integer> <pos:block_pos>", 2)`
+  (`declared_commands`), and the handler repeats the check (`may_administer`) so a source that
+  bypassed a usage's level is still refused. A player source must also be within six blocks of the
+  generator (`within_reach`); the console, command blocks and functions keep acting anywhere.
+  `info` stays a public read.
+- **Tests.** `the_energy_set_control_is_operator_only` (level 2, `info` level 0),
+  `a_player_below_level_two_may_not_administer`, `a_player_acts_only_within_reach`.
+- **In-game.** A LAN guest (level 0) runs `/justdirethings set 123 8 100 0`; the reply is
+  `That generator is out of reach.` and the readout stays `0/1000000 FE`. Evidence:
+  `../_shared/evidence/justdirethings-e2e/e2e-launcher.log` (`PASS` + `EXIT:0`) and
+  `e2e-launcher-control.log` (`EXIT:1`); `check-e2e-logs.py justdirethings-e2e --strict` green.
+- **Package.** `justdirethings.hmod`, **0.2.1**, 30,684 B, sha256
+  `62c233cb7112e60a66c150dd6472dd079600af0ee92eb4701dc53e61f52104df`; two builds byte-identical,
+  `check` and `fits --build 0b14f8a` exit 0.
+
+Skills: superpowers/using-superpowers, brainstorming, writing-plans, test-driven-development, systematic-debugging, verification-before-completion; BeautifulRust/rust-best-practices, rust-port, rust-review

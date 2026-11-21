@@ -1,6 +1,53 @@
-# Validation — Just Dire Things slice 1
+# Validation — Just Dire Things
 
-## The SDK ladder (2026-11-18) — current
+## Slice 2 (the redstone modes), version 0.2.3 — current
+
+Pin **`0a875da91dbb0fdcb7ba8c42c11341aa229af51a`** (Nightly 2026-11-20), horizon-mixins
+**`e59da9094f0c2fdda6c627fe9eff22dec6a906f0`**, launcher **0.2.92**, SDK `ports/_shared/sdk/0a875da/`.
+Every step ran inside a `ports/tools/build-slot.sh` lease (`--job W1-justdirethings`) with
+`CARGO_INCREMENTAL=0`, never a bare cargo in the port and never `--target-dir`. The steps that need
+`cargo horizon-mod` ran with `BUILD_LOCAL=1` (the far box has no such tool); the rest were forwarded.
+
+| Step | Command | Result |
+|---|---|---|
+| red (new family) | `cargo test` | **1 failed / 25 passed**: `a_falling_edge_is_kept_even_when_nothing_burned` — *"a falling edge with no burn must still be written back"* (`../_shared/evidence/justdirethings-slice2/red-falling-edge.log`) |
+| format | `cargo fmt -- --check` | clean (`../_shared/evidence/justdirethings/sdk-fmt.log`) |
+| tests | `cargo test` | **26 passed**, 0 failed (`../_shared/evidence/justdirethings/sdk-test.log`) |
+| clippy | `cargo clippy --all-targets -- -D warnings` | exit 0, 0 warnings (`../_shared/evidence/justdirethings/sdk-clippy.log`) |
+| package build ×2 | `cargo horizon-mod build` (with `rm -f Cargo.lock` before each) | `8c9be198d40173d28253eb1b6d86ee7c8a6b4bc50d6e8578f28c184e5372a3cd` both times, `cmp` identical (`justdirethings-slice2/build-final-{1,2}.log`; the earlier `build-023-*` pair is the same code with the pre-README docs) |
+| package check | `cargo horizon-mod check justdirethings.hmod` | exit 0, `justdirethings 0.2.3 (native-mod, format native-1/0a875da9…/e59da909…, for 26.3)`, 36,240 bytes, SHA-256 `8c9be198…a3cd` (`justdirethings/sdk-check.log`) |
+| fits, the pin | `cargo horizon-mod fits justdirethings.hmod` | `0a875da  made for` (`justdirethings/sdk-fits.log`) |
+| fits, a different build | `cargo horizon-mod fits --build 0b14f8acfd97fa2c750e42795249dcc981178ca4 justdirethings.hmod` | `0b14f8a  fits` (same log) — the cross-build, so the pin line is not a tautology |
+| gate | `python3 ports/tools/verify-sdk-package.py justdirethings` | **1/1**, `26 passed`, 0 clippy warnings, 37 entries, no packed `Cargo.lock` |
+| in-game leg | `build-slot.sh run … --step e2e -- bash tools/e2e.sh` on the launcher-built game | **PASS**, `EXIT:0` (`../_shared/evidence/justdirethings-e2e/e2e-slice2-launcher.log`) |
+| control | the same leg on the same Nightly **without** the package | **`FAIL`**, `EXIT:1` (`e2e-slice2-control.log`) |
+| fail-capability ×2 | `SELFTEST=1` / `SELFTEST=redstone` | **`FAIL`**, `EXIT:1` each (`e2e-slice2-selftest{,-redstone}.log`) |
+| e2e log gate | `python3 ports/tools/check-e2e-logs.py justdirethings-e2e --strict` | `logs=7 ok=7 missing-exit=0 bad-exit=0`, exit 0 |
+| skills gate | `python3 ports/tools/check-skills.py --notes ports/justdirethings` | `SKILLS GATE: PASS`, exit 0 |
+
+The game: `ports/tools/launcher-game.sh build justdirethings` with
+`HORIZON_E2E_INSTANCE=jdt-e2e` — a **fresh** instance, because `native-build` builds on the
+Horizon the named instance plays unless it has none, and the shared `e2e` instance still played
+`0b14f8a`; the fresh instance is what makes the build target this package's own pin (with the old
+one the launcher refuses the package as *"made by an older tool"*, which is the pin mismatch
+speaking, not the package). The launcher then compiled the mod against the Nightly and exported
+`~/.cache/horizon-e2e/0a875da/justdirethings/` (`GAME`, `CTL`) plus
+`…/0a875da/control/horizon-client` (`CONTROL_GAME`, the differential).
+
+Delivered file, in the port root:
+
+```
+justdirethings.hmod  36,240 B  8c9be198d40173d28253eb1b6d86ee7c8a6b4bc50d6e8578f28c184e5372a3cd  37 entries
+```
+
+What this slice adds to the ladder: a **red proof in the pure layer** (the family's rule as a
+failing test, quoted above), the **first in-game run of the port at the SDK pin** (it had none),
+and a **differential inside the leg** — a guest 40 blocks away is refused while the same guest one
+block away lands both writes — so the refusal is distance, not a blanket one.
+
+## Slice 1 (the Simple Coal Generator), 0.1.0–0.2.1 — historical
+
+## The SDK ladder (2026-11-18)
 
 SDK build **`0b14f8acfd97fa2c750e42795249dcc981178ca4`** (2026-11-18), mixins
 **`e59da9094f0c2fdda6c627fe9eff22dec6a906f0`**, launcher 0.2.78; every step ran

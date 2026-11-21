@@ -38,7 +38,8 @@ pub fn burn_speed(fuel_multiplier: i32) -> i32 {
 }
 
 /// The generator's saved state, keyed as upstream saves it (`energy`,
-/// `feRemaining`, `burnRemaining`, `maxBurn`, `fuelBurnMultiplier`).
+/// `feRemaining`, `burnRemaining`, `maxBurn`, `fuelBurnMultiplier`, plus the
+/// redstone control's `redstoneMode`, `pulsed` and `receivingRedstone`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Generator {
     pub energy: i32,
@@ -46,6 +47,8 @@ pub struct Generator {
     pub burn_remaining: i32,
     pub max_burn: i32,
     pub fuel_multiplier: i32,
+    /// Upstream `RedstoneControlData`: the mode and the signal state it reads.
+    pub redstone: RedstoneControl,
 }
 
 impl Default for Generator {
@@ -56,6 +59,7 @@ impl Default for Generator {
             burn_remaining: 0,
             max_burn: 0,
             fuel_multiplier: 1,
+            redstone: RedstoneControl::default(),
         }
     }
 }
@@ -121,11 +125,17 @@ impl Generator {
 
     /// One server tick: burn, then store what the buffer takes. Returns the FE
     /// stored this tick.
-    pub fn tick(&mut self, enabled: bool, mut next_fuel: impl FnMut() -> Option<Fuel>) -> i32 {
-        if !enabled {
-            return 0;
-        }
-        if !self.burning() {
+    ///
+    /// `active` is upstream's `isActiveRedstone()`, asked where upstream asks it:
+    /// once to start a burn and once to top the tick up when a burn ends inside
+    /// it. It is a closure, not a `bool`, because `PULSE` spends its latch on
+    /// each call — a `bool` would let one pulse pay twice.
+    pub fn tick(
+        &mut self,
+        active: &mut impl FnMut() -> bool,
+        mut next_fuel: impl FnMut() -> Option<Fuel>,
+    ) -> i32 {
+        if active() && !self.burning() {
             self.load_fuel(&mut next_fuel);
         }
         if !self.burning() {
@@ -139,9 +149,11 @@ impl Generator {
         }
         self.burn_remaining = self.burn_remaining.saturating_sub(1);
         let mut produced = stored;
-        if !self.burning() {
+        if !self.burning() && active() {
             // The burn ended inside this tick: upstream loads the next item and
-            // tops the tick up, so output does not stutter between fuels.
+            // tops the tick up, so output does not stutter between fuels — but
+            // only while the gate allows it, which is why `active` is asked here
+            // too (in `PULSE` the latch is already spent, so no top-up).
             self.load_fuel(&mut next_fuel);
             if stored < per_tick {
                 let extra = (per_tick - stored)
@@ -167,6 +179,120 @@ impl Generator {
         self.max_burn = self.max_burn.max(0);
         self.fuel_multiplier = self.fuel_multiplier.max(1);
     }
+}
+
+/// Upstream `MiscHelpers.RedstoneMode`: what a machine reads before it burns.
+///
+/// The order is upstream's, because the ordinal is the saved value: `IGNORED`,
+/// `LOW`, `HIGH`, `PULSE` (`MiscHelpers.java`), confirmed by the jar's four GUI
+/// button textures `redstone{ignore,low,high,pulse}.png`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum RedstoneMode {
+    /// Run whatever the signal says (upstream's default).
+    #[default]
+    Ignored,
+    /// Run while no neighbour powers the machine.
+    Low,
+    /// Run while a neighbour powers the machine.
+    High,
+    /// Run one burn per rising edge of the signal.
+    Pulse,
+}
+
+impl RedstoneMode {
+    /// Every mode, in the order upstream saves them.
+    pub const ALL: [Self; 4] = [Self::Ignored, Self::Low, Self::High, Self::Pulse];
+
+    /// The ordinal upstream saves as `redstoneMode`.
+    #[must_use]
+    pub fn ordinal(self) -> i32 {
+        match self {
+            Self::Ignored => 0,
+            Self::Low => 1,
+            Self::High => 2,
+            Self::Pulse => 3,
+        }
+    }
+
+    /// The mode a saved ordinal names. Upstream indexes an array and would throw
+    /// on a value out of range; a save that holds one falls back to the default
+    /// rather than refusing to load the block.
+    #[must_use]
+    pub fn from_ordinal(ordinal: i32) -> Self {
+        match ordinal {
+            1 => Self::Low,
+            2 => Self::High,
+            3 => Self::Pulse,
+            _ => Self::Ignored,
+        }
+    }
+
+    /// The mode's name, for the status line and the harness command.
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Ignored => "ignored",
+            Self::Low => "low",
+            Self::High => "high",
+            Self::Pulse => "pulse",
+        }
+    }
+
+    /// The mode a command's `<mode:word>` names, case-insensitively.
+    #[must_use]
+    pub fn parse(text: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|mode| mode.name().eq_ignore_ascii_case(text))
+    }
+}
+
+/// Upstream `RedstoneControlData`: the chosen mode, whether a neighbour powers the
+/// machine, and the latched pulse `PULSE` is waiting to spend.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RedstoneControl {
+    pub mode: RedstoneMode,
+    pub receiving: bool,
+    pub pulsed: bool,
+}
+
+impl RedstoneControl {
+    /// Upstream `evaluateRedstone`: note whether a neighbour powers the machine,
+    /// and latch one pulse on a rising edge in `PULSE` mode.
+    pub fn sample(&mut self, powered: bool) {
+        if self.mode == RedstoneMode::Pulse && !self.receiving && powered {
+            self.pulsed = true;
+        }
+        self.receiving = powered;
+    }
+
+    /// Upstream `isActiveRedstone`: whether the machine may run this time it is
+    /// asked. `PULSE` *spends* its latch here, so one rising edge buys one call.
+    pub fn active(&mut self) -> bool {
+        match self.mode {
+            RedstoneMode::Ignored => true,
+            RedstoneMode::Low => !self.receiving,
+            RedstoneMode::High => self.receiving,
+            RedstoneMode::Pulse => std::mem::take(&mut self.pulsed),
+        }
+    }
+}
+
+/// Whether a tick's payload must be kept, or may be discarded: upstream's
+/// `setChanged` guard, as the block entity reply expresses it.
+///
+/// A tick that produced nothing and pulled no fuel has nothing to say about the
+/// machine — unless it moved the redstone control, which is part of the same
+/// saved state. A discarded falling edge means the next rising edge is never
+/// seen, and `PULSE` then burns nothing again.
+#[must_use]
+pub fn persists(
+    produced: i32,
+    pulled: u32,
+    before: RedstoneControl,
+    after: RedstoneControl,
+) -> bool {
+    produced != 0 || pulled != 0 || before != after
 }
 
 #[cfg(test)]
@@ -205,7 +331,7 @@ mod tests {
     fn a_generator_with_no_fuel_makes_nothing() {
         let mut generator = Generator::new();
         let mut empty = || None;
-        assert_eq!(generator.tick(true, &mut empty), 0);
+        assert_eq!(generator.tick(&mut || true, &mut empty), 0);
         assert_eq!(generator.energy, 0);
         assert!(!generator.burning());
     }
@@ -218,7 +344,7 @@ mod tests {
         let mut ticks = 0;
         let mut total = 0;
         loop {
-            let made = generator.tick(true, &mut fuel);
+            let made = generator.tick(&mut || true, &mut fuel);
             if made == 0 {
                 break;
             }
@@ -239,7 +365,7 @@ mod tests {
         let mut ticks = 0;
         let mut total = 0;
         loop {
-            let made = generator.tick(true, &mut fuel);
+            let made = generator.tick(&mut || true, &mut fuel);
             if made == 0 {
                 break;
             }
@@ -262,7 +388,7 @@ mod tests {
             calls += 1;
             Some(fuel(1_600, 1.0))
         };
-        assert_eq!(generator.tick(true, &mut counter), 0);
+        assert_eq!(generator.tick(&mut || true, &mut counter), 0);
         assert_eq!(calls, 0, "the item must not even be looked at");
         assert_eq!(generator.energy, CAPACITY);
     }
@@ -274,7 +400,11 @@ mod tests {
             ..Generator::new()
         };
         let mut fuel = one(fuel(1_600, 1.0));
-        assert_eq!(generator.tick(true, &mut fuel), 10, "only the room left");
+        assert_eq!(
+            generator.tick(&mut || true, &mut fuel),
+            10,
+            "only the room left"
+        );
         assert_eq!(generator.energy, CAPACITY);
         assert!(
             generator.burning(),
@@ -283,7 +413,7 @@ mod tests {
         let left = generator.fe_remaining;
         assert_eq!(left, 24_000 - 10);
         // Nothing more fits, so nothing more burns.
-        assert_eq!(generator.tick(true, &mut fuel), 0);
+        assert_eq!(generator.tick(&mut || true, &mut fuel), 0);
         assert_eq!(generator.fe_remaining, left);
     }
 
@@ -298,7 +428,7 @@ mod tests {
                 total += generator.energy;
                 generator.energy = 0;
             }
-            generator.tick(true, &mut fuel);
+            generator.tick(&mut || true, &mut fuel);
         }
         total += generator.energy;
         assert_eq!(total, 24_000, "no energy is destroyed at the buffer's edge");
@@ -319,7 +449,7 @@ mod tests {
         };
         let mut made = Vec::new();
         for _ in 0..50 {
-            made.push(generator.tick(true, &mut fuel));
+            made.push(generator.tick(&mut || true, &mut fuel));
         }
         assert_eq!(made.iter().sum::<i32>(), 3_000, "two 100-tick fuels");
         assert!(
@@ -332,7 +462,7 @@ mod tests {
     fn a_disabled_generator_burns_nothing() {
         let mut generator = Generator::new();
         let mut fuel = one(fuel(1_600, 1.0));
-        assert_eq!(generator.tick(false, &mut fuel), 0);
+        assert_eq!(generator.tick(&mut || false, &mut fuel), 0);
         assert_eq!(generator.energy, 0);
         assert!(!generator.burning());
     }
@@ -353,6 +483,7 @@ mod tests {
             burn_remaining: -9,
             max_burn: -1,
             fuel_multiplier: 0,
+            ..Generator::new()
         };
         generator.normalise();
         assert_eq!(generator.energy, 0);
@@ -367,5 +498,283 @@ mod tests {
         };
         over.normalise();
         assert_eq!(over.energy, CAPACITY);
+    }
+
+    // --- the redstone control (slice 2) ---
+
+    #[test]
+    fn the_four_modes_are_upstreams_and_round_trip() {
+        // Upstream's declaration order is the saved ordinal: IGNORED, LOW, HIGH, PULSE.
+        let names = RedstoneMode::ALL.map(RedstoneMode::name);
+        assert_eq!(names, ["ignored", "low", "high", "pulse"]);
+        for (ordinal, mode) in RedstoneMode::ALL.into_iter().enumerate() {
+            assert_eq!(mode.ordinal(), ordinal as i32, "{mode:?} keeps its ordinal");
+            assert_eq!(
+                RedstoneMode::from_ordinal(ordinal as i32),
+                mode,
+                "{mode:?} round-trips through the save"
+            );
+            assert_eq!(RedstoneMode::parse(mode.name()), Some(mode));
+        }
+        assert_eq!(RedstoneMode::parse("HIGH"), Some(RedstoneMode::High));
+        assert_eq!(RedstoneMode::parse("silly"), None);
+        // The order is load-bearing on its own: the ordinal *is* the saved value.
+        assert_eq!(RedstoneMode::ALL.len(), 4);
+    }
+
+    #[test]
+    fn an_unknown_saved_mode_reads_as_ignored() {
+        // Upstream indexes an array and would throw; a save from a newer build
+        // must not refuse to load the block.
+        assert_eq!(RedstoneMode::from_ordinal(-1), RedstoneMode::Ignored);
+        assert_eq!(RedstoneMode::from_ordinal(9), RedstoneMode::Ignored);
+        assert_eq!(RedstoneMode::default(), RedstoneMode::Ignored);
+    }
+
+    #[test]
+    fn ignored_runs_whatever_the_signal() {
+        let mut control = RedstoneControl::default();
+        assert!(control.active(), "IGNORED runs with no signal");
+        control.sample(true);
+        assert!(control.active(), "IGNORED runs with a signal");
+    }
+
+    #[test]
+    fn low_runs_unpowered_high_runs_powered() {
+        let mut low = RedstoneControl {
+            mode: RedstoneMode::Low,
+            ..RedstoneControl::default()
+        };
+        assert!(low.active(), "LOW runs with no signal");
+        low.sample(true);
+        assert!(
+            !low.active(),
+            "LOW must not run while a neighbour powers it"
+        );
+        low.sample(false);
+        assert!(low.active(), "LOW runs again when the signal goes");
+
+        let mut high = RedstoneControl {
+            mode: RedstoneMode::High,
+            ..RedstoneControl::default()
+        };
+        assert!(
+            !high.active(),
+            "HIGH with no signal must not run: nothing is powering it"
+        );
+        high.sample(true);
+        assert!(high.active(), "HIGH runs while powered");
+        high.sample(false);
+        assert!(!high.active(), "HIGH stops when the signal goes");
+    }
+
+    #[test]
+    fn pulse_runs_once_per_rising_edge_and_ignores_a_held_signal() {
+        let mut control = RedstoneControl {
+            mode: RedstoneMode::Pulse,
+            ..RedstoneControl::default()
+        };
+        assert!(!control.active(), "PULSE with no edge yet does not run");
+        control.sample(true);
+        assert!(control.active(), "the rising edge runs the machine once");
+        assert!(!control.active(), "the pulse is spent after one run");
+        control.sample(true);
+        assert!(
+            !control.active(),
+            "a signal that stays on rises once, so it runs no more"
+        );
+        control.sample(false);
+        assert!(!control.active(), "a falling edge runs nothing");
+        control.sample(true);
+        assert!(control.active(), "the next rising edge runs it again");
+    }
+
+    /// A generator wired to its own redstone control, as the glue wires it: the
+    /// signal is sampled once a tick and the gate is the control's answer.
+    struct Rig {
+        generator: Generator,
+    }
+
+    impl Rig {
+        fn with(mode: RedstoneMode) -> Self {
+            Self {
+                generator: Generator {
+                    redstone: RedstoneControl {
+                        mode,
+                        ..RedstoneControl::default()
+                    },
+                    ..Generator::new()
+                },
+            }
+        }
+
+        fn tick(&mut self, powered: bool, next_fuel: impl FnMut() -> Option<Fuel>) -> i32 {
+            self.generator.redstone.sample(powered);
+            let mut control = self.generator.redstone;
+            let made = self.generator.tick(&mut || control.active(), next_fuel);
+            self.generator.redstone = control;
+            made
+        }
+    }
+
+    /// Two fuels that record how many were taken.
+    fn counted(
+        fuel_item: Fuel,
+    ) -> (
+        impl FnMut() -> Option<Fuel>,
+        std::rc::Rc<std::cell::Cell<u32>>,
+    ) {
+        let taken = std::rc::Rc::new(std::cell::Cell::new(0));
+        let seen = std::rc::Rc::clone(&taken);
+        let mut left = 2;
+        let next = move || {
+            if left == 0 {
+                return None;
+            }
+            left -= 1;
+            seen.set(seen.get() + 1);
+            Some(fuel_item)
+        };
+        (next, taken)
+    }
+
+    #[test]
+    fn a_pulse_starts_one_burn_that_then_runs_its_course() {
+        // A stick's worth: 100 burn ticks at speed 4 → 25 ticks of 60 FE.
+        let mut rig = Rig::with(RedstoneMode::Pulse);
+        let (mut fuels, taken) = counted(fuel(100, 1.0));
+        assert_eq!(rig.tick(true, &mut fuels), 60, "the rising edge starts it");
+        assert_eq!(taken.get(), 1, "one fuel is taken");
+        // The signal stays on with no further edge: the burn it started keeps
+        // paying, because upstream only consults the gate to *start* a burn.
+        let mut total = 60;
+        for _ in 0..24 {
+            total += rig.tick(true, &mut fuels);
+        }
+        assert_eq!(total, 1_500, "100 burn ticks x 15 FE");
+        assert_eq!(rig.tick(true, &mut fuels), 0, "the burn is over");
+        assert_eq!(taken.get(), 1, "no second fuel without a new edge");
+    }
+
+    #[test]
+    fn no_new_burn_starts_without_the_next_edge() {
+        let mut rig = Rig::with(RedstoneMode::Pulse);
+        let (mut fuels, taken) = counted(fuel(100, 1.0));
+        for _ in 0..20 {
+            rig.tick(false, &mut fuels);
+        }
+        assert_eq!(taken.get(), 0, "an unpowered pulse machine burns nothing");
+        assert_eq!(rig.generator.energy, 0);
+        // A rising edge buys one burn; after it is spent, twenty more powered
+        // ticks buy none.
+        rig.tick(true, &mut fuels);
+        for _ in 0..20 {
+            rig.tick(true, &mut fuels);
+        }
+        assert_eq!(taken.get(), 1, "the held signal is not a series of pulses");
+        // An edge that arrives while the first burn is still paying is spent on
+        // nothing: upstream asks the gate to *start* a burn, and this tick is
+        // not one. The fuel stays put.
+        rig.tick(false, &mut fuels);
+        for _ in 0..10 {
+            rig.tick(true, &mut fuels);
+        }
+        assert_eq!(
+            taken.get(),
+            1,
+            "an edge inside a burn starts no second fuel"
+        );
+        // Once the burn is over, the next rising edge does start one.
+        for _ in 0..20 {
+            rig.tick(true, &mut fuels);
+        }
+        assert!(!rig.generator.burning(), "the first burn has ended");
+        rig.tick(false, &mut fuels);
+        for _ in 0..25 {
+            rig.tick(true, &mut fuels);
+        }
+        assert_eq!(taken.get(), 2, "the next rising edge starts the next fuel");
+    }
+
+    #[test]
+    fn high_mode_keeps_an_in_progress_burn_and_starts_no_new_one_when_power_drops() {
+        let mut rig = Rig::with(RedstoneMode::High);
+        let (mut fuels, taken) = counted(fuel(100, 1.0));
+        assert_eq!(
+            rig.tick(false, &mut fuels),
+            0,
+            "unpowered HIGH does not start"
+        );
+        assert_eq!(taken.get(), 0);
+        assert_eq!(rig.tick(true, &mut fuels), 60, "powered HIGH burns");
+        // The power drops mid-burn: the burn finishes, no new fuel is taken.
+        let mut total = 60;
+        for _ in 0..40 {
+            total += rig.tick(false, &mut fuels);
+        }
+        assert_eq!(total, 1_500, "the burn that started runs to its end");
+        assert_eq!(taken.get(), 1, "the drop in power starts nothing new");
+    }
+
+    #[test]
+    fn a_pulse_does_not_top_up_the_tick_a_burn_ends_in() {
+        // 110 burn ticks are 1,650 FE: 27 full 60 FE ticks and a last one of 30.
+        // Upstream asks `isActiveRedstone()` again for the top-up, and in PULSE
+        // the latch is already spent, so the boundary tick pays only its 30.
+        let mut rig = Rig::with(RedstoneMode::Pulse);
+        let (mut fuels, taken) = counted(fuel(110, 1.0));
+        for _ in 0..27 {
+            assert_eq!(rig.tick(true, &mut fuels), 60, "a full tick");
+        }
+        assert_eq!(
+            rig.tick(true, &mut fuels),
+            30,
+            "the boundary tick, no top-up"
+        );
+        assert_eq!(rig.generator.energy, 1_650, "the whole fuel is still paid");
+        assert_eq!(taken.get(), 1, "the spare fuel was not pulled in to top up");
+    }
+
+    #[test]
+    fn ignored_still_tops_up_the_tick_a_burn_ends_in() {
+        // The same two fuels without a mode: the boundary tick pays a whole 60,
+        // which is the behaviour the slice must not regress.
+        let mut rig = Rig::with(RedstoneMode::Ignored);
+        let (mut fuels, taken) = counted(fuel(110, 1.0));
+        for _ in 0..27 {
+            assert_eq!(rig.tick(true, &mut fuels), 60);
+        }
+        assert_eq!(rig.tick(true, &mut fuels), 60, "IGNORED tops the tick up");
+        assert_eq!(taken.get(), 2, "the second fuel pays the rest");
+    }
+
+    #[test]
+    fn a_falling_edge_is_kept_even_when_nothing_burned() {
+        // The signal drops while the machine has no fuel: nothing is produced and
+        // the slot does not move, but the saved `receiving` must still be written
+        // back — otherwise the next rising edge is not a rising edge any more and
+        // `PULSE` never burns its second fuel.
+        let before = RedstoneControl {
+            mode: RedstoneMode::Pulse,
+            receiving: true,
+            pulsed: false,
+        };
+        let after = RedstoneControl {
+            receiving: false,
+            ..before
+        };
+        assert!(
+            persists(0, 0, before, after),
+            "a falling edge with no burn must still be written back"
+        );
+        assert!(
+            !persists(0, 0, before, before),
+            "a tick that changed nothing is not written back"
+        );
+        assert!(persists(60, 1, before, before), "a burn is written back");
+        assert!(
+            persists(0, 1, before, before),
+            "a fuel pulled but not yet paid is written back"
+        );
     }
 }

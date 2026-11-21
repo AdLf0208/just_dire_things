@@ -103,6 +103,29 @@ Derived behaviour (all unit-tested in `runtime.rs`):
   variant), a full-cube shape, `strength(2.0)`, metal sounds, and
   `isRedstoneConductor = false`.
 
+## Slice 2 — the redstone control, as the artefact states it
+
+Read at the same tag/commit, in these files: `util/MiscHelpers.java` (`RedstoneMode`),
+`util/interfacehelpers/RedstoneControlData.java`, `common/blockentities/basebe/RedstoneControlledBE.java`,
+`common/blockentities/basebe/BaseMachineBE.java`, `common/blocks/baseblocks/BaseMachineBlock.java`,
+`common/blockentities/GeneratorT1BE.java`.
+
+- **The mode set and its order.** `MiscHelpers.RedstoneMode` declares `IGNORED, LOW, HIGH, PULSE`
+  and `RedstoneControlData` saves the enum's ordinal as `redstoneMode`; the jar's own GUI button
+  textures `redstone{ignore,low,high,pulse}.png` agree. The ordinal is therefore load-bearing.
+- **Sampling.** `evaluateRedstone` records the neighbour signal into `receivingRedstone` and, in
+  `PULSE` only, latches `pulsed` on a **rising** edge (`!receivingRedstone && powered`).
+  `BaseMachineBlock.neighborChanged` clears the latch on a block update.
+- **The gate.** `isActiveRedstone()` answers per mode: `IGNORED` true, `LOW` `!receiving`,
+  `HIGH` `receiving`, `PULSE` the latch *spent* by the read. `GeneratorT1BE.doGenerate` asks it
+  twice — to start a burn, and again for the "top the tick up when a burn ends" branch — which is
+  why `PULSE` does not top up the boundary tick but `IGNORED` does.
+- **No comparator output.** No `hasAnalogOutputSignal`/`getAnalogOutputSignal` override exists on
+  `BaseMachineBlock` or any machine block entity in 1.5.7, so the port does not implement one.
+- **The tick writes its state unconditionally** (`setChanged` on every tick that ran), which is
+  why the pin's `BlockEntityTickReply::Unchanged` shortcut is a *port* decision, not upstream's;
+  see `notes.md` §Slice 2 for the defect that shortcut caused and its fix.
+
 ## Deliberate differences
 
 1. **No push-out to neighbours** (gap 1): upstream pushes `fe_per_tick × 10`
@@ -118,3 +141,9 @@ Derived behaviour (all unit-tested in `runtime.rs`):
    is consumed; upstream replaces the whole stack with the remainder.
 5. **Settings/contents on break** are not carried into the block item, and a
    broken generator loses its FE and fuel (upstream saves/restores them).
+6. **The saved redstone state is written only when it moved** (slice 2): the tick
+   replies `Unchanged` to the engine only when nothing burnt, no fuel left the
+   slot and the redstone control is identical to what it read. Upstream calls
+   `setChanged()` every tick; the pin's reply is what keeps the chunk clean, and
+   it must never be a reason to lose the signal level (the first in-game run did,
+   and `PULSE` could not see its second edge).

@@ -1,19 +1,12 @@
-# Just Dire Things — a Horizon port
+# Just Dire Things for Horizon — slice 1: the Simple Coal Generator
 
-**Just Dire Things** is a Minecraft mod. Just some things Direwolf20 wants to have. This repository is a **port of it to [Horizon](https://github.com/horizon-rust/horizon)**, the Rust engine for Minecraft Java 26.3. It carries the complete source of the port plus the content files it ships, and installs as a single `.hmod` package.
+A clean-room Rust rewrite of **Just Dire Things 1.5.7**'s Simple Coal Generator
+(`justdirethings:generatort1`) and the four coals it burns (`coal_t1..t4`) for
+Horizon (Minecraft Java 26.3). Ported from MIT source; see
+[`LICENSE-NOTICE.md`](LICENSE-NOTICE.md). Local-only until the maintainer
+approves publishing.
 
-Upstream: [Direwolf20-MC/JustDireThings](https://github.com/Direwolf20-MC/JustDireThings) — licence **MIT**.
-
-| | |
-|---|---|
-| Upstream mod | Just Dire Things ([source](https://github.com/Direwolf20-MC/JustDireThings)) |
-| Ported to | Horizon 0b14f8a, Minecraft Java 26.3, mod API `0.2` |
-| Package | `justdirethings.hmod` (install it with the Horizon launcher) |
-| Licence | **MIT** — the upstream mod's licence; see [Licence and credit](#licence-and-credit) |
-
-## What this port implements
-
-### What the slice implements
+## What the slice implements
 
 - the generator block + item, carried from the jar (models, textures, lang,
   loot, recipe, pickaxe tag);
@@ -27,47 +20,53 @@ Upstream: [Direwolf20-MC/JustDireThings](https://github.com/Direwolf20-MC/JustDi
 - `/justdirethings info <x> <y> <z>` and `/justdirethings set <fe> <x> <y> <z>`
   (the latter a harness control).
 
-## Not yet ported
+## Not in this slice
 
-- **Push-out to neighbours** (`providePowerAdjacent`, `fePerTick × 10` per side).
-- **No GUI/menu.** Upstream opens `GeneratorT1Screen`; this slice has no menu
-- **The Fuel Generator** (`generatorfluidt1`): 5,000,000 FE buffer, 5,000 FE/t,
-- **The Energy Transmitter** (`energytransmitter`): the network, per-side
-- **The pocket generator** (item FE): `item_energy_buffer` (API 307) plus an
-- **Item automation**: `itemcollector`, `sensort1/t2`, `clickert1/t2`,
-- **Goo and farming** (`gooblock_tier1..4`, `goosoil_tier1..4`,
-- **Time and paradox** (`time_crystal_*`, `time_fluid`, `paradoxmachine`,
+Push-out to neighbours, the GUI/menu, the Fuel Generator, the Energy
+Transmitter, the pocket generator, item automation, goo, time crystals and tools
+are recorded gaps in [`notes.md`](notes.md).
 
-## Installing
+## Build
 
-1. Install the [Horizon launcher](https://github.com/horizon-rust/horizon/releases) (0.2.70 or newer).
-2. Add `justdirethings.hmod` to the instance's mods.
-3. The package is pinned to a specific Horizon build; the launcher checks that pin.
+This is a flat **SDK package** (Horizon's mod-API merge retired `.hnmod`): one
+`.hmod` carries the code (`src/lib.rs` + `src/runtime.rs`) and the content
+(`assets/`, `data/`), built by the launcher against the game build
+`horizon-mod.toml`'s `[native]` pins.
 
-## Licence and credit
+```sh
+# the pure logic, without the game
+cargo test
 
-Just Dire Things was created by its upstream authors; the code, models and assets in the original mod
-remain theirs and are used here under **MIT**. The Rust in this repository is a clean-room
-rewrite for Horizon, not a translation of the original source.
-
-- `LICENSE` — the upstream licence text.
-- `LICENSE-NOTICE.md` — what this port carries and where it came from.
-- The upstream project: https://github.com/Direwolf20-MC/JustDireThings
-
-## Technical details
-
-```
-horizon-mod.toml   package manifest (id, version, api, [native] pin)
-Cargo.toml         the crate; depends on `horizon-mod-api` from the fetched SDK
-src/               lib.rs (the one `impl Hooks`), runtime.rs (pure logic + tests), glue
-assets/ data/      the content the package ships
-tools/             content generators and the e2e scenario
+# everything else, through the campaign's build slots
+ports/tools/build-slot.sh run --job jdt-pack --port ports/justdirethings \
+    --step build -- tools/package.sh          # build, check, deliver + hash
+ports/tools/build-slot.sh run --job jdt-check --port ports/justdirethings \
+    --step check -- cargo horizon-mod check justdirethings.hmod
 ```
 
-- Build: `cargo horizon-mod build` (packages; it does not compile against the game).
-- Test: `cargo test`, `cargo clippy --all-targets -- -D warnings`.
-- In-game: `ports/tools/launcher-game.sh run justdirethings` in the campaign tree, or install the
-  `.hmod` and play; the harness scenario is `tools/e2e.sh`.
+The fetched SDK (`.horizon/sdk/`, from any `cargo horizon-mod` command) is never
+packed. Content sources are rebuilt from the jar with
+`python3 tools/assemble_content.py`.
 
-This repository is generated from the campaign's port at `ports/justdirethings/`; the port's own
-`notes.md` is the full record (decisions, traps, evidence).
+The deliverable is **`justdirethings.hmod` in this directory** (the package is
+the port: there is no separate content file and no `.hnmod`):
+`justdirethings 0.2.3 (native-mod, format native-1/0a875da…/e59da90…, for 26.3)`.
+Its size, SHA-256, entry count and the reproducibility check are recorded in
+[`VALIDATION.md`](VALIDATION.md) — this file travels inside the package, so it
+cannot quote the package's own hash and stay true.
+
+`tools/e2e.sh` is the in-game scenario, run on the game the launcher built from
+this package at the campaign pin:
+
+```sh
+ports/tools/launcher-game.sh build justdirethings
+eval "$(ports/tools/launcher-game.sh env justdirethings)"
+ports/tools/build-slot.sh run --job jdt-e2e --port ports/justdirethings \
+    --step e2e -- bash ports/justdirethings/tools/e2e.sh
+```
+
+It covers the generator (coal at 24,000 FE, Primal Coal at 72,000, the full-buffer
+gate, the capacity clamp), the four redstone modes, and a distance differential on
+the harness commands; `CONTROL_GAME` (exported by `launcher-game.sh env`) makes one
+leg run on the same Nightly without the package, and `SELFTEST=1` /
+`SELFTEST=redstone` flip one assertion each.
